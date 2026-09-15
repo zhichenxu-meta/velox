@@ -6645,6 +6645,10 @@ class RPCNode : public PlanNode {
   /// @param streamingMode The streaming mode for RPC execution.
   /// @param dispatchBatchSize For BATCH mode pipelining: fire callBatch()
   ///        every N rows during addInput() instead of collecting all rows.
+  /// @param setupOptions Optional setup-only options recovered from a
+  ///        dynamic runtime options expression. RPCOperator passes these to
+  ///        the function only during initialization; call remains authoritative
+  ///        for row-time arguments.
   RPCNode(
       const PlanNodeId& id,
       PlanNodePtr source,
@@ -6652,7 +6656,8 @@ class RPCNode : public PlanNode {
       std::string outputColumn,
       RowTypePtr outputType,
       rpc::RPCStreamingMode streamingMode = rpc::RPCStreamingMode::kPerRow,
-      int32_t dispatchBatchSize = 0);
+      int32_t dispatchBatchSize = 0,
+      std::optional<std::string> setupOptions = std::nullopt);
 
   const PlanNodePtr& source() const {
     return sources_[0];
@@ -6683,6 +6688,11 @@ class RPCNode : public PlanNode {
     return dispatchBatchSize_;
   }
 
+  /// Returns setup-only options recovered without evaluating row expressions.
+  const std::optional<std::string>& setupOptions() const {
+    return setupOptions_;
+  }
+
   std::string_view name() const override {
     return "RPC";
   }
@@ -6708,6 +6718,7 @@ class RPCNode : public PlanNode {
   RowTypePtr outputType_;
   rpc::RPCStreamingMode streamingMode_;
   int32_t dispatchBatchSize_{0};
+  std::optional<std::string> setupOptions_;
 };
 
 using RPCNodePtr = std::shared_ptr<RPCNode>;

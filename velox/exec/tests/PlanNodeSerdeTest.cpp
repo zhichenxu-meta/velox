@@ -1418,6 +1418,22 @@ TEST_F(PlanNodeSerdeTest, rpcNode) {
           outputType,
           rpc::RPCStreamingMode::kPerRow,
           0));
+
+  // Dynamic runtime options with an independently recovered setup snapshot.
+  testSerde(
+      std::make_shared<core::RPCNode>(
+          "rpc-4",
+          source,
+          std::make_shared<core::CallTypedExpr>(
+              VARCHAR(),
+              "test_function",
+              std::make_shared<core::FieldAccessTypedExpr>(
+                  VARCHAR(), "prompt")),
+          "response",
+          outputType,
+          rpc::RPCStreamingMode::kPerRow,
+          0,
+          R"({"inference_backend":"ipnext"})"));
 }
 
 } // namespace facebook::velox::exec::test

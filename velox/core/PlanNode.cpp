@@ -4500,14 +4500,16 @@ RPCNode::RPCNode(
     std::string outputColumn,
     RowTypePtr outputType,
     rpc::RPCStreamingMode streamingMode,
-    int32_t dispatchBatchSize)
+    int32_t dispatchBatchSize,
+    std::optional<std::string> setupOptions)
     : PlanNode(id),
       sources_{std::move(source)},
       call_(std::move(call)),
       outputColumn_(std::move(outputColumn)),
       outputType_(std::move(outputType)),
       streamingMode_(streamingMode),
-      dispatchBatchSize_(dispatchBatchSize) {
+      dispatchBatchSize_(dispatchBatchSize),
+      setupOptions_(std::move(setupOptions)) {
   VELOX_CHECK_NOT_NULL(call_, "RPCNode call must not be null");
   VELOX_CHECK(
       outputType_->containsChild(outputColumn_),
@@ -4548,6 +4550,9 @@ folly::dynamic RPCNode::serialize() const {
   obj["streamingMode"] =
       streamingMode_ == rpc::RPCStreamingMode::kBatch ? "BATCH" : "PER_ROW";
   obj["dispatchBatchSize"] = dispatchBatchSize_;
+  if (setupOptions_.has_value()) {
+    obj["setupOptions"] = setupOptions_.value();
+  }
   return obj;
 }
 
@@ -4586,6 +4591,10 @@ PlanNodePtr RPCNode::create(const folly::dynamic& obj, void* context) {
       : rpc::RPCStreamingMode::kPerRow;
   auto dispatchBatchSize =
       static_cast<int32_t>(obj["dispatchBatchSize"].asInt());
+  std::optional<std::string> setupOptions;
+  if (obj.count("setupOptions")) {
+    setupOptions = obj["setupOptions"].asString();
+  }
   return std::make_shared<RPCNode>(
       deserializePlanNodeId(obj),
       std::move(source),
@@ -4593,7 +4602,8 @@ PlanNodePtr RPCNode::create(const folly::dynamic& obj, void* context) {
       std::move(outputColumn),
       std::move(outputType),
       streamingMode,
-      dispatchBatchSize);
+      dispatchBatchSize,
+      std::move(setupOptions));
 }
 
 } // namespace facebook::velox::core

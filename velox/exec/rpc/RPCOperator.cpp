@@ -108,12 +108,24 @@ void RPCOperator::initialize() {
 
   // Initialize the function with query config, argument types, and constants.
   // The function creates/caches its own transport and clients internally.
-  function_->initialize(
-      operatorCtx_->driverCtx()->queryConfig(), inputTypes, constantInputs);
+  // The instruction goes in with everything else the function needs: it
+  // resolves its backend and how it will serve the instruction on that backend
+  // in one place, and the framework never learns which path it picked.
+  const std::optional<std::string_view> setupOptions =
+      rpcNode_->setupOptions().has_value()
+      ? std::optional<std::string_view>{rpcNode_->setupOptions().value()}
+      : std::nullopt;
+  auto* driverCtx = operatorCtx_->driverCtx();
+  VELOX_CHECK_NOT_NULL(driverCtx);
+  const auto& queryConfig = driverCtx->queryConfig();
+  function_->initializeWithSetupOptions(
+      queryConfig,
+      inputTypes,
+      constantInputs,
+      setupOptions,
+      rpcNode_->streamingMode());
 
   tierKey_ = function_->tierKey();
-
-  const auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
 
   // Size output vectors from config; see getOutput().
   outputBatchRows_ = queryConfig.preferredOutputBatchRows();
@@ -147,7 +159,9 @@ void RPCOperator::initialize() {
                  << ", operatorId=" << operatorId() << ", streamingMode="
                  << (rpcNode_->streamingMode() == RPCStreamingMode::kBatch
                          ? "BATCH"
-                         : "PER_ROW");
+                         : "PER_ROW")
+                 << ", dispatchPath="
+                 << RpcDispatchPathName::toName(function_->dispatchPath());
 
   if (!argumentSources_.empty()) {
     RPC_OP_VLOG(1) << "Initialized with " << argumentSources_.size()

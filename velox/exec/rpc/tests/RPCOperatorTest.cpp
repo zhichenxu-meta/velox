@@ -39,6 +39,9 @@
 #include <folly/futures/Future.h>
 
 #include <chrono>
+#include <optional>
+#include <string>
+#include <string_view>
 
 #include "velox/exec/Task.h"
 
@@ -82,6 +85,26 @@ class InvalidAdmissionBatchRPCFunction : public DemoBatchRPCFunction {
   }
 };
 
+class SetupOptionsRecordingRPCFunction : public DemoAsyncRPCFunction {
+ public:
+  void initializeWithSetupOptions(
+      const core::QueryConfig& queryConfig,
+      const std::vector<TypePtr>& inputTypes,
+      const std::vector<VectorPtr>& constantInputs,
+      std::optional<std::string_view> setupOptions,
+      RPCStreamingMode instruction) override {
+    receivedSetupOptions() = setupOptions.has_value()
+        ? std::optional<std::string>{setupOptions.value()}
+        : std::nullopt;
+    initialize(queryConfig, inputTypes, constantInputs, instruction);
+  }
+
+  static std::optional<std::string>& receivedSetupOptions() {
+    static std::optional<std::string> value;
+    return value;
+  }
+};
+
 class RPCOperatorTest : public OperatorTestBase {
  protected:
   static void SetUpTestCase() {
@@ -106,6 +129,9 @@ class RPCOperatorTest : public OperatorTestBase {
     AsyncRPCFunctionRegistry::registerFunction(
         "invalid_admission_batch_rpc",
         []() { return std::make_shared<InvalidAdmissionBatchRPCFunction>(); });
+    AsyncRPCFunctionRegistry::registerFunction(
+        "setup_options_recording_rpc",
+        []() { return std::make_shared<SetupOptionsRecordingRPCFunction>(); });
     AsyncRPCFunctionRegistry::registerFunction("demo_batch_rpc_reversed", []() {
       return std::make_shared<DemoBatchRPCFunction>(
           DemoBatchRPCFunction::ResponseOrder::kReversed);
@@ -221,7 +247,8 @@ class RPCOperatorTest : public OperatorTestBase {
   core::PlanNodePtr makeRPCNode(
       const core::PlanNodePtr& source,
       const std::vector<std::string>& argumentColumnNames,
-      const std::string& functionName = "demo_rpc") {
+      const std::string& functionName = "demo_rpc",
+      std::optional<std::string> setupOptions = std::nullopt) {
     auto sourceType = source->outputType();
 
     std::vector<core::TypedExprPtr> callInputs;
@@ -243,7 +270,14 @@ class RPCOperatorTest : public OperatorTestBase {
     auto outputType = ROW(std::move(outputNames), std::move(outputTypes));
 
     return std::make_shared<core::RPCNode>(
-        "rpc-0", source, std::move(call), "__rpc_result", outputType);
+        "rpc-0",
+        source,
+        std::move(call),
+        "__rpc_result",
+        outputType,
+        RPCStreamingMode::kPerRow,
+        0,
+        std::move(setupOptions));
   }
 };
 
@@ -273,6 +307,28 @@ TEST_F(RPCOperatorTest, basicPerRow) {
   EXPECT_EQ(rows["hello world"], "demo: hello world");
   EXPECT_EQ(rows["test prompt"], "demo: test prompt");
   EXPECT_EQ(rows["third row"], "demo: third row");
+}
+
+TEST_F(RPCOperatorTest, forwardsSetupOptionsDuringInitialization) {
+  constexpr std::string_view kSetupOptions =
+      R"({"inference_backend":"ipnext","tier_override":"test.tier"})";
+  SetupOptionsRecordingRPCFunction::receivedSetupOptions().reset();
+  auto input =
+      makeRowVector({"prompt"}, {makeFlatVector<StringView>({"hello world"})});
+  auto plan = makeRPCNode(
+      PlanBuilder().values({input}).planNode(),
+      {"prompt"},
+      "setup_options_recording_rpc",
+      std::string{kSetupOptions});
+
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+
+  EXPECT_EQ(result->size(), 1);
+  ASSERT_TRUE(
+      SetupOptionsRecordingRPCFunction::receivedSetupOptions().has_value());
+  EXPECT_EQ(
+      SetupOptionsRecordingRPCFunction::receivedSetupOptions().value(),
+      kSetupOptions);
 }
 
 // kPerRow output is sized from QueryConfig::preferredOutputBatchRows: 50 rows
@@ -565,10 +621,15 @@ class MismatchedResultTypeRPCFunction : public AsyncRPCFunction {
   void initialize(
       const core::QueryConfig&,
       const std::vector<TypePtr>&,
-      const std::vector<VectorPtr>&) override {}
+      const std::vector<VectorPtr>&,
+      RPCStreamingMode) override {}
 
   std::string name() const override {
     return "mismatched_result_type_rpc";
+  }
+
+  RpcDispatchPath dispatchPath() const override {
+    return RpcDispatchPath::kPerRow;
   }
 
   TypePtr resultType() const override {
@@ -1096,17 +1157,26 @@ class SlowBatchRPCFunction : public AsyncRPCFunction {
       std::shared_ptr<folly::CPUThreadPoolExecutor> executor)
       : latency_(latency), executor_(std::move(executor)) {}
 
-  void initialize(
-      const core::QueryConfig&,
-      const std::vector<TypePtr>&,
-      const std::vector<VectorPtr>&) override {}
-
   std::string name() const override {
     return "slow_batch_rpc";
   }
 
   TypePtr resultType() const override {
     return VARCHAR();
+  }
+
+  void initialize(
+      const core::QueryConfig&,
+      const std::vector<TypePtr>&,
+      const std::vector<VectorPtr>&,
+      RPCStreamingMode instruction) override {
+    dispatchPath_ = instruction == RPCStreamingMode::kBatch
+        ? RpcDispatchPath::kNativeBatch
+        : RpcDispatchPath::kPerRow;
+  }
+
+  RpcDispatchPath dispatchPath() const override {
+    return dispatchPath_;
   }
 
   std::vector<std::pair<vector_size_t, folly::SemiFuture<RPCResponse>>>
@@ -1155,6 +1225,9 @@ class SlowBatchRPCFunction : public AsyncRPCFunction {
     return pending_;
   }
 
+ protected:
+  RpcDispatchPath dispatchPath_{RpcDispatchPath::kPerRow};
+
  private:
   const std::chrono::milliseconds latency_;
   std::shared_ptr<folly::CPUThreadPoolExecutor> executor_;
@@ -1163,6 +1236,30 @@ class SlowBatchRPCFunction : public AsyncRPCFunction {
       const std::vector<RPCResponse>& responses,
       memory::MemoryPool* pool) const override {
     return buildTextOutput(responses, pool);
+  }
+};
+
+// A batch function that can only answer once initialize() has run, like the
+// production functions: they resolve their backend from query config and
+// constant arguments there, and the path they can serve follows from it.
+class LateResolvingRPCFunction : public SlowBatchRPCFunction {
+ public:
+  using SlowBatchRPCFunction::SlowBatchRPCFunction;
+
+  std::string name() const override {
+    return "late_resolving_rpc";
+  }
+
+  void initialize(
+      const core::QueryConfig&,
+      const std::vector<TypePtr>&,
+      const std::vector<VectorPtr>&,
+      RPCStreamingMode instruction) override {
+    // Resolving the backend and the path it implies in one call is the order
+    // the production functions use, and the reason both live in initialize().
+    dispatchPath_ = instruction == RPCStreamingMode::kBatch
+        ? RpcDispatchPath::kNativeBatch
+        : RpcDispatchPath::kPerRow;
   }
 };
 
@@ -1256,6 +1353,34 @@ TEST_F(RPCOperatorTest, perRowCongestionPath) {
   EXPECT_EQ(rows["OVERLOAD one"], "demo: OVERLOAD one");
   EXPECT_EQ(rows["OVERLOAD two"], "demo: OVERLOAD two");
   EXPECT_EQ(rows["normal three"], "demo: normal three");
+}
+
+// A BATCH query reaches the function as an instruction, and the function
+// resolves it against the backend it settled in the same call. Nothing can ask
+// before the backend exists, so a batch query cannot silently degrade to
+// per-row.
+TEST_F(RPCOperatorTest, batchInstructionReachesTheFunction) {
+  auto rpcExecutor = std::make_shared<folly::CPUThreadPoolExecutor>(4);
+  std::shared_ptr<LateResolvingRPCFunction> function;
+  AsyncRPCFunctionRegistry::registerFunction(
+      "late_resolving_rpc", [&function, rpcExecutor]() {
+        function = std::make_shared<LateResolvingRPCFunction>(
+            std::chrono::milliseconds{0}, rpcExecutor);
+        return function;
+      });
+
+  auto input = makeRowVector(
+      {"prompt"}, {makeFlatVector<StringView>({StringView("hi")})});
+  auto plan = makeBatchRPCNode(
+      PlanBuilder().values({input}).planNode(),
+      {"prompt"},
+      "late_resolving_rpc");
+
+  auto result = AssertQueryBuilder(plan).maxDrivers(1).copyResults(pool());
+  ASSERT_EQ(result->size(), 1);
+
+  ASSERT_NE(function, nullptr);
+  EXPECT_EQ(function->dispatchPath(), RpcDispatchPath::kNativeBatch);
 }
 
 } // namespace facebook::velox::exec::rpc

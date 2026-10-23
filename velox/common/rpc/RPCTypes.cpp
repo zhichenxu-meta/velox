@@ -63,6 +63,18 @@ void RPCResponse::setError(RPCErrorKind kind, std::string errorMessage) {
       kind != RPCErrorKind::kNone,
       "RPC response error kind must name a cause, not kNone");
   result_ = folly::makeUnexpected(RpcError{kind, std::move(errorMessage)});
+  capacityRetry_.reset();
+}
+
+void RPCResponse::setCapacityRetry(CapacityRetry retry) {
+  VELOX_CHECK(hasError(), "Capacity retry applies only to an error response");
+  VELOX_CHECK(
+      errorCategory(errorKind()) == RPCErrorCategory::kOverload,
+      "Capacity retry applies only to an overload error, got kind: {}",
+      static_cast<int>(errorKind()));
+  VELOX_CHECK_GE(retry.retryAfter.count(), 0);
+  VELOX_CHECK_GT(retry.budget.count(), 0);
+  capacityRetry_ = retry;
 }
 
 } // namespace facebook::velox::rpc
